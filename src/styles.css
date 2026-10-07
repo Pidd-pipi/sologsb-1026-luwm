@@ -178,6 +178,61 @@ button, input, textarea, select { font: inherit; }
 .diff-list article.removed > span { color: #a2191f; }
 .diff-list b { font-size: 12px; }
 .diff-list p { margin: 3px 0 0; color: #6f6f6f; font-size: 10px; }
+
+/* 全局提示与派生结果重算提示 */
+.app-notice { top: 122px; }
+.recompute-banner { margin-bottom: 16px; max-width: 100%; }
+.invalidation-note { margin: 8px 0; padding: 8px 10px; border-left: 3px solid #f1c21b; background: #fff8e4; color: #6f6f6f; font-size: 10px; line-height: 1.6; }
+.prereq-phonemes { margin: 14px 0; padding: 12px 14px; background: #f4f4f4; border-left: 3px solid #0f62fe; }
+.prereq-phonemes > div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.phoneme-chip, .merge-flag { padding: 2px 7px; color: #0043ce; background: #edf5ff; font: 600 10px "IBM Plex Mono", monospace; font-style: normal; }
+.merge-flag { margin-left: 8px; color: #6929c4; background: #f6f2ff; }
+
+/* 学习路径的分课分组 */
+.lesson-group { border-bottom: 2px solid #161616; }
+.lesson-heading { display: flex; justify-content: space-between; gap: 12px; padding: 10px 12px; color: #fff; background: #004144; font-size: 11px; }
+.lesson-heading b { font: 600 11px "IBM Plex Mono", monospace; letter-spacing: .08em; }
+.lesson-heading span { color: #c5f6f3; font-size: 10px; }
+
+/* 离线合并导入面板 */
+.import-card { margin-bottom: 14px; padding: 22px; }
+.file-button { position: relative; display: inline-flex; align-items: center; padding: 9px 15px; border: 1px solid #0f62fe; color: #0f62fe; background: #fff; font-size: 12px; cursor: pointer; }
+.file-button:hover { background: #edf5ff; }
+.file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.import-actions { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.merge-stage { margin-top: 20px; padding-top: 18px; border-top: 1px dashed #8d8d8d; }
+.merge-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.merge-note { margin-bottom: 12px; }
+.merge-group-heading { margin: 18px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #161616; }
+.merge-entries { display: grid; gap: 8px; }
+.merge-entry { padding: 14px 16px; border: 1px solid #e0e0e0; border-left: 4px solid #8d8d8d; background: #fff; }
+.merge-entry.divergent { border-left-color: #8a3ffc; background: #fbf9ff; }
+.merge-entry.added-incoming { border-left-color: #198038; background: #f7fdf9; }
+.merge-entry.added-local { border-left-color: #8d8d8d; }
+.merge-entry.one-sided { border-left-color: #0f62fe; background: #f7faff; }
+.merge-entry header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.entry-id { font: 600 11px "IBM Plex Mono", monospace; color: #4f4f4f; }
+.merge-entry header small { color: #6f6f6f; font-size: 10px; }
+.entry-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
+.entry-sides > div { padding: 10px 12px; background: #f4f4f4; }
+.entry-sides > div.missing { background: #fff1f1; border: 1px dashed #da1e28; }
+.entry-sides b { display: block; margin-bottom: 4px; font-size: 11px; color: #161616; }
+.entry-sides p { margin: 0 0 4px; font-size: 12px; }
+.entry-sides small { display: block; color: #6f6f6f; font-size: 10px; line-height: 1.6; }
+.entry-sides .entry-missing { color: #a2191f; }
+.resolution-row { display: flex; flex-wrap: wrap; gap: 14px; padding-top: 8px; border-top: 1px solid #e0e0e0; }
+.resolution-row label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #393939; cursor: pointer; }
+.capacity-bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 16px; padding: 14px 16px; border: 1px solid #198038; border-left: 4px solid #198038; background: #defbe6; }
+.capacity-bar.short { border-color: #da1e28; background: #fff1f1; }
+.capacity-bar b { display: block; margin: 3px 0; font-size: 13px; color: #161616; }
+.capacity-bar p { margin: 0; color: #525252; font-size: 11px; line-height: 1.6; }
+.reclaim-panel { margin-top: 12px; padding: 14px 16px; border: 1px solid #f1c21b; background: #fffdf0; }
+.reclaim-panel h4 { margin: 0 0 6px; font-size: 12px; }
+.reclaim-row { display: block; padding: 4px 0; border-bottom: 1px solid #f0e8c8; }
+.exclude-versions { display: block; margin-top: 12px; }
+.merge-actions { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+.merge-disclaimer { margin: 8px 0 0; color: #6f6f6f; font-size: 10px; }
+.version-row { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
 .app-footer { min-height: 46px; padding: 14px 24px; display: flex; justify-content: space-between; gap: 20px; color: #c6c6c6; background: #262626; font-size: 10px; }
 @media (max-width: 1180px) {
   .compose-layout { grid-template-columns: 280px 1fr; }

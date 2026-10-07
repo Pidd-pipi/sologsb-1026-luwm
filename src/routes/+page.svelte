@@ -11,25 +11,27 @@
     TextInput,
     Tile
   } from 'carbon-components-svelte';
+  import {
+    COURSE_SCHEMA_VERSION,
+    upgradeCourse,
+    type Activity,
+    type ActivityType,
+    type Course,
+    type PreviewWidth
+  } from '$lib/course';
+  import {
+    applyMergePlan,
+    buildMergePlan,
+    describeChangedFields,
+    type MergeEntry,
+    type MergePlan,
+    type MergeResolution
+  } from '$lib/merge';
+  import { analyzeCourse, compareCourseVersions } from '$lib/diagnostics';
+  import { DerivedCache, WIDTH_LABEL, type PathLesson } from '$lib/derived';
+  import { assessMergeCapacity, formatKb, listReclaimableVersions, safeSetItem, type CapacityReport } from '$lib/quota';
 
-  type ActivityType = '音素' | '单词' | '句子' | '练习';
   type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
-  type PreviewWidth = 'phone' | 'tablet' | 'desktop';
-  type IssueLevel = 'error' | 'warning' | 'info';
-
-  interface Activity {
-    id: string;
-    type: ActivityType;
-    title: string;
-    content: string;
-    phonemes: string[];
-    dependencies: string[];
-    difficulty: number;
-    prompt: string;
-    accessibility: string;
-    duration: number;
-    feedback: string;
-  }
 
   interface CourseVersion {
     id: string;
@@ -37,26 +39,6 @@
     savedAt: string;
     note: string;
     activities: Activity[];
-  }
-
-  interface Course {
-    id: string;
-    title: string;
-    level: string;
-    ageRange: string;
-    objective: string;
-    activities: Activity[];
-    versions: CourseVersion[];
-    updatedAt: string;
-  }
-
-  interface Diagnostic {
-    id: string;
-    activityId: string;
-    level: IssueLevel;
-    category: string;
-    title: string;
-    detail: string;
   }
 
   interface VersionDiff {
@@ -67,11 +49,9 @@
   }
 
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
-  const confusablePairs = [
-    ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
-  ];
 
-  const initialCourse = (): Course => ({
+  // v1 示例课程缺少 schemaVersion 等新字段，载入后统一走 upgradeCourse 升级补齐
+  const sampleCourseV1 = {
     id: 'course-phonics-1',
     title: 'Starter Phonics · 声音侦探',
     level: '启蒙一级',
@@ -155,9 +135,9 @@
         ]
       }
     ]
-  });
+  };
 
-  let course: Course = initialCourse();
+  let course: Course = upgradeCourse(sampleCourseV1).course;
   let selectedActivityId = course.activities[0]?.id ?? '';
   let activeView: ViewMode = 'compose';
   let previewWidth: PreviewWidth = 'desktop';
@@ -170,25 +150,69 @@
   let history: Course[] = [];
   let future: Course[] = [];
   let selectedActivity: Activity | null = null;
-  let diagnostics: Diagnostic[] = [];
+  let diagnostics: ReturnType<typeof analyzeCourse> = [];
   let versionDiff: VersionDiff[] = [];
+  const derivedCache = new DerivedCache();
+  let derivedSnapshot = derivedCache.resolve(course).snapshot;
+  let lastRecomputed = false;
+
+  // 全局提示与离线合并暂存区
+  let noticeKind: 'success' | 'error' | 'info' = 'info';
+  let noticeTitle = '';
+  let noticeDetail = '';
+  let showNotice = false;
+  let importText = '';
+  let importError = '';
+  let mergePlan: MergePlan | null = null;
+  let capacity: CapacityReport | null = null;
+  let excludeIncomingVersions = false;
+  let selectedReclaimIds = new Set<string>();
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
-  $: diagnostics = analyzeCourse(course);
+  $: if (hydrated) refreshDerived();
+  function refreshDerived(): void {
+    const resolved = derivedCache.resolve(course);
+    derivedSnapshot = resolved.snapshot;
+    lastRecomputed = resolved.recomputed;
+  }
+  $: diagnostics = analyzeCourse(course, derivedSnapshot);
   $: versionDiff = compareCourseVersions(course, compareBaseId, compareTargetId);
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: pathLessons = derivedSnapshot.paths[previewWidth];
+
+  // 老师在暂存区调整处理方式或回收旧版本时，实时重新估算容量（仍不写入任何数据）
+  $: if (mergePlan) {
+    const candidate = planWithOptions(mergePlan, excludeIncomingVersions, selectedReclaimIds);
+    capacity = assessMergeCapacity(course, candidate);
+  }
+
+  function planWithOptions(plan: MergePlan, skipIncomingVersions: boolean, reclaimIds: Set<string>): Course {
+    const applied = applyMergePlan(course, plan).course;
+    if (skipIncomingVersions) applied.versions = applied.versions.filter((version) => !plan.versionsToBring.some((item) => item.id === version.id));
+    if (reclaimIds.size) applied.versions = applied.versions.filter((version) => !reclaimIds.has(version.id));
+    return applied;
+  }
+
+  function notify(kind: 'success' | 'error' | 'info', title: string, detail = ''): void {
+    noticeKind = kind;
+    noticeTitle = title;
+    noticeDetail = detail;
+    showNotice = true;
+  }
 
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       try {
-        course = migrateCourse(JSON.parse(stored) as Course);
+        const { course: upgraded, notes } = upgradeCourse(JSON.parse(stored));
+        course = upgraded;
         selectedActivityId = course.activities[0]?.id ?? '';
         compareBaseId = course.versions[0]?.id ?? '';
         compareTargetId = course.versions.at(-1)?.id ?? '';
         savedLabel = `已恢复 · ${formatTime(course.updatedAt)}`;
+        if (notes.length) notify('info', '本地课程已按新结构升级补齐', notes.join('；'));
       } catch {
         localStorage.removeItem(STORAGE_KEY);
       }
@@ -207,26 +231,21 @@
     };
   });
 
-  function migrateCourse(value: Course): Course {
-    if (!value.id || !Array.isArray(value.activities)) return initialCourse();
-    value.versions ??= [];
-    return value;
-  }
-
-  function commit(recipe: (draft: Course) => void): void {
+  function commit(recipe: (draft: Course) => void, successLabel: string | undefined = undefined): void {
     history = [...history.slice(-49), structuredClone(course)];
     const next = structuredClone(course);
     recipe(next);
     next.updatedAt = new Date().toISOString();
+    const written = safeSetItem(STORAGE_KEY, JSON.stringify(next));
+    if (!written.ok) {
+      history = history.slice(0, -1);
+      notify('error', '本地空间不足，这次修改没有保存', `在用课程保持原样。可到“版本与复用”里清理旧版本快照：${written.error}`);
+      activeView = 'versions';
+      return;
+    }
     course = next;
     future = [];
-    persist();
-  }
-
-  function persist(): void {
-    if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
-    savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
+    savedLabel = successLabel ?? `已保存 · ${formatTime(new Date().toISOString())}`;
   }
 
   function undo(): void {
@@ -236,7 +255,8 @@
     history = history.slice(0, -1);
     course = previous;
     selectedActivityId = course.activities[0]?.id ?? '';
-    persist();
+    savedLabel = `已撤销 · ${formatTime(new Date().toISOString())}`;
+    persistQuiet();
   }
 
   function redo(): void {
@@ -246,11 +266,19 @@
     future = future.slice(1);
     course = next;
     selectedActivityId = course.activities[0]?.id ?? '';
-    persist();
+    savedLabel = `已重做 · ${formatTime(new Date().toISOString())}`;
+    persistQuiet();
+  }
+
+  function persistQuiet(): void {
+    if (!hydrated) return;
+    safeSetItem(STORAGE_KEY, JSON.stringify(course));
   }
 
   function saveNow(): void {
-    persist();
+    const written = safeSetItem(STORAGE_KEY, JSON.stringify(course));
+    savedLabel = written.ok ? `已保存 · ${formatTime(new Date().toISOString())}` : '保存失败：空间不足';
+    if (!written.ok) notify('error', '本地空间不足，保存被拒绝', '请先在“版本与复用”里回收旧版本快照。');
   }
 
   function updateCourse(field: 'title' | 'level' | 'ageRange' | 'objective', value: string): void {
@@ -294,7 +322,7 @@
       draft.activities.push({
         id, type, title: `新的${type}活动`, content: '', phonemes: [], dependencies: [],
         difficulty: 1, prompt: '请输入教师提示语。', accessibility: '请描述视觉、听觉或键盘无障碍支持。',
-        duration: type === '练习' ? 10 : 8, feedback: type === '练习' ? '' : ''
+        duration: type === '练习' ? 10 : 8, feedback: ''
       });
     });
     selectedActivityId = id;
@@ -319,6 +347,7 @@
     source.id = `a-${Date.now()}`;
     source.title = `${source.title}（副本）`;
     source.dependencies = [...source.dependencies];
+    delete source.mergeTag;
     commit((draft) => {
       const index = draft.activities.findIndex((activity) => activity.id === selectedActivity?.id);
       draft.activities.splice(index + 1, 0, source);
@@ -356,13 +385,22 @@
       draft.versions.push({
         id: `v-${Date.now()}`, label: `版本 ${versionNumber}`, savedAt: new Date().toISOString(),
         note: `保存 ${draft.activities.length} 个活动，总计 ${draft.activities.reduce((sum, item) => sum + item.duration, 0)} 分钟。`,
-        activities: structuredClone(draft.activities)
+        activities: structuredClone(draft.activities.map(({ mergeTag: _mergeTag, ...rest }) => rest))
       });
-    });
+    }, `版本 ${versionNumber} 已存档`);
     const latest = course.versions.at(-1);
     compareTargetId = latest?.id ?? '';
     if (!compareBaseId) compareBaseId = course.versions.at(-2)?.id ?? '';
-    savedLabel = `版本 ${versionNumber} 已存档`;
+  }
+
+  function deleteVersion(versionId: string): void {
+    const target = course.versions.find((version) => version.id === versionId);
+    if (!target) return;
+    commit((draft) => {
+      draft.versions = draft.versions.filter((version) => version.id !== versionId);
+    }, `已回收快照「${target.label}」`);
+    if (compareBaseId === versionId) compareBaseId = course.versions[0]?.id ?? '';
+    if (compareTargetId === versionId) compareTargetId = course.versions.at(-1)?.id ?? '';
   }
 
   function copyCourse(): void {
@@ -373,148 +411,194 @@
       copy.versions = [];
       copy.activities.forEach((activity) => {
         activity.title = activity.title.replace('（副本）', '') + '（复制）';
+        delete activity.mergeTag;
       });
       draft.id = copy.id;
       draft.title = copy.title;
       draft.versions = copy.versions;
       draft.activities = copy.activities;
-    });
-    savedLabel = '课程已复制为新草稿';
+    }, '课程已复制为新草稿');
   }
 
-  function focusIssue(issue: Diagnostic): void {
+  function focusIssue(issue: { activityId: string }): void {
     selectedActivityId = issue.activityId;
     activeView = 'compose';
   }
 
-  function analyzeCourse(current: Course): Diagnostic[] {
-    const issues: Diagnostic[] = [];
-    const learned = new Set<string>();
-    const seenPhonemes: Array<{ activity: Activity; phoneme: string }> = [];
+  // ---- 离线合并导入 ----
 
-    current.activities.forEach((activity, index) => {
-      activity.phonemes.forEach((phoneme) => {
-        if (!learned.has(phoneme) && activity.type !== '音素') {
-          issues.push({
-            id: `early-${activity.id}-${phoneme}`, activityId: activity.id, level: 'error', category: '前置知识',
-            title: `${activity.title} 提前使用 ${phoneme}`,
-            detail: `第 ${index + 1} 个活动中使用了尚未单独教学的音素。请增加前置音素活动或调整顺序。`
-          });
-        }
-        if (activity.type === '音素') learned.add(phoneme);
-        seenPhonemes.push({ activity, phoneme });
-      });
-
-      if (activity.type === '句子') {
-        const words = activity.content.trim().split(/\s+/).filter(Boolean);
-        if (words.length > 12) issues.push({
-          id: `long-${activity.id}`, activityId: activity.id, level: 'warning', category: '例句长度',
-          title: `${activity.title} 包含 ${words.length} 个单词`,
-          detail: '启蒙阶段建议控制在 12 个单词以内，或拆成两个意群。'
-        });
-      }
-
-      if (activity.type === '练习' && !activity.feedback.trim()) issues.push({
-        id: `feedback-${activity.id}`, activityId: activity.id, level: 'error', category: '练习反馈',
-        title: `${activity.title} 缺少反馈`,
-        detail: '答对或答错后需要给出可理解、可行动的学习反馈。'
-      });
-
-      if (!activity.accessibility.trim()) issues.push({
-        id: `a11y-${activity.id}`, activityId: activity.id, level: 'error', category: '无障碍说明',
-        title: `${activity.title} 缺少无障碍说明`,
-        detail: '请说明视觉、听觉、运动或认知支持方式。'
-      });
-
-      activity.dependencies.forEach((dependency) => {
-        if (!current.activities.some((item) => item.id === dependency)) issues.push({
-          id: `missing-dep-${activity.id}-${dependency}`, activityId: activity.id, level: 'error', category: '依赖缺失',
-          title: `${activity.title} 的依赖已不存在`, detail: '请移除失效依赖或重新选择前置活动。'
-        });
-      });
-    });
-
-    confusablePairs.forEach(([left, right]) => {
-      const leftActivity = seenPhonemes.find((item) => item.phoneme === left)?.activity;
-      const rightActivity = seenPhonemes.find((item) => item.phoneme === right)?.activity;
-      if (leftActivity && rightActivity) issues.push({
-        id: `confusable-${left}-${right}`, activityId: rightActivity.id, level: 'info', category: '相似音',
-        title: `${left} 与 ${right} 可能混淆`,
-        detail: `建议在“${leftActivity.title}”和“${rightActivity.title}”之间加入口型对比或辨音练习。`
-      });
-    });
-
-    const cycle = findDependencyCycle(current.activities);
-    if (cycle) issues.push({
-      id: 'cycle', activityId: cycle[0], level: 'error', category: '依赖关系',
-      title: '活动依赖形成循环', detail: cycle.join(' → ')
-    });
-    return issues;
+  function parseImport(): void {
+    importError = '';
+    mergePlan = null;
+    capacity = null;
+    selectedReclaimIds = new Set();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(importText);
+    } catch (error) {
+      importError = `内容不是有效的 JSON：${error instanceof Error ? error.message : '解析失败'}`;
+      return;
+    }
+    const { plan, error } = buildMergePlan(course, parsed);
+    if (error || !plan) {
+      importError = error ?? '无法生成合并方案';
+      return;
+    }
+    mergePlan = plan;
+    notify('info', '合并方案已生成，当前课程尚未改动', '请逐条确认两边都改过的活动，再执行合并。');
   }
 
-  function findDependencyCycle(activities: Activity[]): string[] | null {
-    const byId = new Map(activities.map((activity) => [activity.id, activity]));
-    const visiting = new Set<string>();
-    const visited = new Set<string>();
-    let cycle: string[] = [];
-    const visit = (id: string, path: string[]): boolean => {
-      if (visiting.has(id)) {
-        cycle = [...path.slice(path.indexOf(id)), id];
-        return true;
-      }
-      if (visited.has(id)) return false;
-      visiting.add(id);
-      const activity = byId.get(id);
-      for (const dependency of activity?.dependencies ?? []) {
-        if (visit(dependency, [...path, dependency])) return true;
-      }
-      visiting.delete(id);
-      visited.add(id);
-      return false;
+  function handleImportFile(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      importText = String(reader.result ?? '');
+      parseImport();
     };
-    for (const activity of activities) {
-      if (visit(activity.id, [activity.id])) break;
-    }
-    return cycle.length ? cycle : null;
+    reader.onerror = () => { importError = '读取文件失败，请换用粘贴文本的方式导入。'; };
+    reader.readAsText(file);
   }
 
-  function compareCourseVersions(current: Course, baseId: string, targetId: string): VersionDiff[] {
-    const base = current.versions.find((version) => version.id === baseId);
-    const target = current.versions.find((version) => version.id === targetId);
-    if (!base || !target) return [];
-    const rows: VersionDiff[] = [];
-    const baseMap = new Map(base.activities.map((activity) => [activity.id, activity]));
-    const targetMap = new Map(target.activities.map((activity) => [activity.id, activity]));
-    for (const activity of base.activities) {
-      if (!targetMap.has(activity.id)) rows.push({ id: activity.id, title: activity.title, kind: 'removed', detail: '目标版本已删除该活动' });
+  function setResolution(entry: MergeEntry, resolution: MergeResolution): void {
+    if (!mergePlan || entry.resolution === resolution) return;
+    mergePlan = {
+      ...mergePlan,
+      entries: mergePlan.entries.map((item) => (item.id === entry.id ? { ...item, resolution } : item))
+    };
+  }
+
+  function toggleReclaim(versionId: string, checked: boolean): void {
+    if (checked) selectedReclaimIds.add(versionId);
+    else selectedReclaimIds.delete(versionId);
+    selectedReclaimIds = new Set(selectedReclaimIds);
+  }
+
+  function toggleExcludeIncomingVersions(event: Event): void {
+    excludeIncomingVersions = readChecked(event);
+  }
+
+  function mergedCoursePreview(): Course | null {
+    if (!mergePlan) return null;
+    return planWithOptions(mergePlan, excludeIncomingVersions, selectedReclaimIds);
+  }
+
+  function executeMerge(): void {
+    if (!mergePlan || !capacity) return;
+    const candidate = mergedCoursePreview();
+    if (!candidate) return;
+    const report = assessMergeCapacity(course, candidate);
+    if (!report.fits) {
+      capacity = report;
+      notify('error', '本地容量不足，合并已被拒绝', '在用课程没有被改动；请回收下方旧版本快照后重试。');
+      return;
     }
-    for (const activity of target.activities) {
-      const before = baseMap.get(activity.id);
-      if (!before) {
-        rows.push({ id: activity.id, title: activity.title, kind: 'added', detail: `${activity.type} · ${activity.duration} 分钟` });
-        continue;
-      }
-      const fields: string[] = [];
-      if (before.title !== activity.title) fields.push('标题');
-      if (before.content !== activity.content) fields.push('内容');
-      if (before.difficulty !== activity.difficulty) fields.push('难度');
-      if (before.duration !== activity.duration) fields.push('时长');
-      if (JSON.stringify(before.dependencies) !== JSON.stringify(activity.dependencies)) fields.push('依赖');
-      if (before.prompt !== activity.prompt || before.accessibility !== activity.accessibility) fields.push('提示或无障碍');
-      if (before.feedback !== activity.feedback) fields.push('练习反馈');
-      if (fields.length) rows.push({ id: activity.id, title: activity.title, kind: 'changed', detail: `变化字段：${fields.join('、')}` });
+    const applied = applyMergePlan(course, mergePlan);
+    const finalCourse = candidate;
+    const stats = applied.stats;
+
+    // 依赖或音素变化：预告派生结果失效；resolve 会把前置音素、循环依赖、各宽度路径重算
+    const dependencyChanged = mergePlan.entries.some(
+      (entry) => entry.changedFields.includes('dependencies') || entry.changedFields.includes('phonemes')
+    ) || mergePlan.counts['added-incoming'] > 0;
+    if (dependencyChanged) {
+      derivedCache.pendingReason = '离线合并';
+      derivedCache.pendingDetail = '离线合并带入了新活动或修改了依赖、音素，前置音素、循环依赖与各宽度学习路径已按合并后课程作废重算。';
     }
-    return rows;
+
+    history = [...history.slice(-49), structuredClone(course)];
+    future = [];
+    const written = safeSetItem(STORAGE_KEY, JSON.stringify(finalCourse));
+    if (!written.ok) {
+      history = history.slice(0, -1);
+      capacity = assessMergeCapacity(course, candidate);
+      notify('error', '写入失败，合并未应用', `在用课程完好：${written.error}`);
+      return;
+    }
+    course = finalCourse;
+    selectedActivityId = course.activities[0]?.id ?? '';
+    compareBaseId = course.versions[0]?.id ?? '';
+    compareTargetId = course.versions.at(-1)?.id ?? '';
+    savedLabel = `合并已应用 · ${formatTime(new Date().toISOString())}`;
+    notify(
+      'success',
+      '离线合并已完成',
+      `补入 ${stats.added} 条、更新 ${stats.updated} 条、并列保留 ${stats.duplicated} 组两版活动，带入 ${stats.versionsBrought} 个版本快照。`
+    );
+    mergePlan = null;
+    capacity = null;
+    importText = '';
+    selectedReclaimIds = new Set();
+  }
+
+  function dismissMerge(): void {
+    mergePlan = null;
+    capacity = null;
+    importError = '';
+    selectedReclaimIds = new Set();
+  }
+
+  function reclaimSelectedVersions(): void {
+    if (!selectedReclaimIds.size) return;
+    const ids = new Set(selectedReclaimIds);
+    // 在当前课程上回收快照以腾出空间；活动本体不动，已生成的合并方案仍有效
+    const next = structuredClone(course);
+    next.versions = next.versions.filter((version) => !ids.has(version.id));
+    next.updatedAt = new Date().toISOString();
+    const written = safeSetItem(STORAGE_KEY, JSON.stringify(next));
+    if (!written.ok) {
+      notify('error', '回收过程中写入失败', '在用课程未改动。');
+      return;
+    }
+    history = [...history.slice(-49), structuredClone(course)];
+    course = next;
+    future = [];
+    selectedReclaimIds = new Set();
+    savedLabel = `已回收 ${ids.size} 个旧版本快照 · ${formatTime(new Date().toISOString())}`;
+  }
+
+  function exportPackage(): void {
+    const payload = JSON.stringify(course, null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${course.title || 'phonics-course'}-离线课程包.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    notify('success', '离线课程包已导出', '其他老师可在“版本与复用”里导入并按活动编号合并。');
+  }
+
+  function statusLabel(status: MergeEntry['status']): string {
+    return status === 'added-local' ? '仅本地'
+      : status === 'added-incoming' ? '仅导入包'
+      : status === 'unchanged' ? '两边一致'
+      : status === 'one-sided' ? '一边修改'
+      : '两边都改';
+  }
+
+  const entryGroups: Array<{ key: 'added-incoming' | 'divergent' | 'one-sided' | 'unchanged' | 'added-local'; heading: string }> = [
+    { key: 'added-incoming', heading: '只有导入包有 · 将直接补上' },
+    { key: 'divergent', heading: '两边都改过 · 并列两版待选定' },
+    { key: 'one-sided', heading: '只有一边相对共同版本改过' },
+    { key: 'unchanged', heading: '两边一致' },
+    { key: 'added-local', heading: '只有本地有' }
+  ];
+
+  const importPlaceholder = '{"id":"course-...","activities":[...]}';
+
+  function selectedReclaimBytes(report: CapacityReport): number {
+    return [...selectedReclaimIds].reduce(
+      (sum, id) => sum + (report.reclaimable.find((item) => item.versionId === id)?.bytes ?? 0),
+      0
+    );
   }
 
   function formatTime(value: string): string {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
     return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
-  }
-
-  function activityIcon(type: ActivityType): string {
-    return type === '音素' ? 'ear' : type === '单词' ? 'text-font' : type === '句子' ? 'text-align-left' : 'game-console';
   }
 
   function handleKeyboard(event: KeyboardEvent): void {
@@ -577,6 +661,11 @@
       <InlineNotification lowContrast kind="info" title="已切换到离线模式" subtitle="所有修改会先保存在本机浏览器，恢复网络后仍可继续编辑。" />
     </div>
   {/if}
+  {#if showNotice}
+    <div class="offline-notice app-notice">
+      <InlineNotification lowContrast kind={noticeKind} title={noticeTitle} subtitle={noticeDetail} on:close={() => (showNotice = false)} />
+    </div>
+  {/if}
 
   <section class="course-hero">
     <div class="hero-copy">
@@ -593,10 +682,10 @@
   </section>
 
   <nav class="workspace-tabs" aria-label="工作区">
-    <button class:active={activeView === 'compose'} on:click={() => activeView = 'compose'}><span>01</span><b>课程编排</b><small>活动、依赖与教学说明</small></button>
-    <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
-    <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
-    <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'compose'} on:click={() => (activeView = 'compose')}><span>01</span><b>课程编排</b><small>活动、依赖与教学说明</small></button>
+    <button class:active={activeView === 'path'} on:click={() => (activeView = 'path')}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
+    <button class:active={activeView === 'issues'} on:click={() => (activeView = 'issues')}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
+    <button class:active={activeView === 'versions'} on:click={() => (activeView = 'versions')}><span>04</span><b>版本与合并</b><small>复制、导入合并与比较</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -613,10 +702,10 @@
         </div>
         <div class="activity-list">
           {#each course.activities as activity, index (activity.id)}
-            <button class:selected={activity.id === selectedActivityId} class="activity-row" on:click={() => selectedActivityId = activity.id}>
+            <button class:selected={activity.id === selectedActivityId} class="activity-row" on:click={() => (selectedActivityId = activity.id)}>
               <span class="sequence">{String(index + 1).padStart(2, '0')}</span>
               <span class="activity-type {activity.type}">{activity.type}</span>
-              <span class="activity-copy"><b>{activity.title}</b><small>{activity.duration} 分钟 · 难度 {activity.difficulty}/5</small></span>
+              <span class="activity-copy"><b>{activity.title}</b><small>{activity.duration} 分钟 · 难度 {activity.difficulty}/5{#if activity.mergeTag} · {activity.mergeTag}{/if}</small></span>
               {#if activity.dependencies.length}<i title="有前置依赖">↳</i>{/if}
             </button>
           {/each}
@@ -663,9 +752,17 @@
 
           <Tile class="dependency-card">
             <div class="section-title">
-              <div><span class="kicker">PREREQUISITES</span><h3>前置活动与依赖关系</h3><p>只有完成选中的活动后，系统才会按当前顺序推荐本活动。</p></div>
+              <div><span class="kicker">PREREQUISITES</span><h3>前置活动与依赖关系</h3><p>勾选前置活动；下方音素为沿依赖链重算的前置音素，依赖或音素变化后自动作废重算。</p></div>
               <Tag type="cool-gray">{selectedActivity.dependencies.length} 个依赖</Tag>
             </div>
+            {#if derivedSnapshot.prerequisitePhonemes[selectedActivity.id]?.length}
+              <div class="prereq-phonemes">
+                <span class="kicker">前置音素（已重算）</span>
+                <div>
+                  {#each derivedSnapshot.prerequisitePhonemes[selectedActivity.id] as phoneme}<span class="phoneme-chip">{phoneme}</span>{/each}
+                </div>
+              </div>
+            {/if}
             <div class="dependency-grid">
               {#each course.activities.filter((activity) => activity.id !== selectedActivity?.id) as activity (activity.id)}
                 <Checkbox
@@ -689,6 +786,9 @@
         </Tile>
         <Tile class="compact-card issue-peek">
           <div class="section-title"><div><span class="kicker">LIVE CHECK</span><h3>实时提示</h3></div><Tag type={errorCount ? 'red' : 'green'}>{errorCount ? `${errorCount} 项` : '通过'}</Tag></div>
+          {#each derivedCache.invalidations.slice(0, 1) as invalidation}
+            <p class="invalidation-note">↻ {invalidation.reason}：{invalidation.detail}</p>
+          {/each}
           {#each diagnostics.slice(0, 4) as issue}
             <button on:click={() => focusIssue(issue)} class="peek-row">
               <i class:error={issue.level === 'error'} class:warning={issue.level === 'warning'}></i>
@@ -696,7 +796,7 @@
             </button>
           {/each}
           {#if diagnostics.length === 0}<p class="empty-state">课程结构完整，没有发现提示。</p>{/if}
-          <Button size="small" kind="ghost" on:click={() => activeView = 'issues'}>查看全部检查</Button>
+          <Button size="small" kind="ghost" on:click={() => (activeView = 'issues')}>查看全部检查</Button>
         </Tile>
       </aside>
     </main>
@@ -705,35 +805,49 @@
   {#if activeView === 'path'}
     <main class="path-view">
       <div class="path-toolbar">
-        <div><span class="kicker">RESPONSIVE SEQUENCE</span><h2>学习顺序预览</h2><p>按活动依赖和课程顺序生成，可切换设备宽度检查信息密度。</p></div>
+        <div><span class="kicker">RESPONSIVE SEQUENCE</span><h2>学习顺序预览</h2><p>按课程顺序把活动分课，依赖或音素变化后旧分组作废重算；切换宽度查看不同信息密度。</p></div>
         <div class="width-switcher">
-          <button class:active={previewWidth === 'phone'} on:click={() => previewWidth = 'phone'}>手机</button>
-          <button class:active={previewWidth === 'tablet'} on:click={() => previewWidth = 'tablet'}>平板</button>
-          <button class:active={previewWidth === 'desktop'} on:click={() => previewWidth = 'desktop'}>桌面</button>
+          <button class:active={previewWidth === 'phone'} on:click={() => (previewWidth = 'phone')}>手机</button>
+          <button class:active={previewWidth === 'tablet'} on:click={() => (previewWidth = 'tablet')}>平板</button>
+          <button class:active={previewWidth === 'desktop'} on:click={() => (previewWidth = 'desktop')}>桌面</button>
         </div>
       </div>
+      {#if lastRecomputed || derivedCache.invalidations[0]}
+        <InlineNotification class="recompute-banner" lowContrast kind="warning" title="学习路径刚按最新依赖与音素重算" subtitle={derivedCache.invalidations[0]?.detail ?? '宽度切换使用各自缓存的分组结果。'} hideCloseButton />
+      {/if}
       <div class="preview-stage">
         <div class="device-preview {previewWidth}">
-          <div class="device-bar"><span></span><b>{previewWidth === 'phone' ? '390 px' : previewWidth === 'tablet' ? '768 px' : '1200 px'}</b></div>
+          <div class="device-bar"><span></span><b>{previewWidth === 'phone' ? '390 px · 每课 2 个活动' : previewWidth === 'tablet' ? '768 px · 每课 3 个活动' : '1200 px · 每课 4 个活动'}</b></div>
           <div class="lesson-preview">
-            <header><span>今日学习</span><h3>{course.title}</h3><p>{course.objective}</p></header>
-            {#each course.activities as activity, index (activity.id)}
-              <article>
-                <div class="lesson-number">{index + 1}</div>
-                <div class="lesson-type {activity.type}">{activity.type}</div>
-                <div class="lesson-content">
-                  <h4>{activity.title}</h4>
-                  <p>{activity.content}</p>
-                  {#if activity.prompt}<blockquote>{activity.prompt}</blockquote>{/if}
-                  <div class="lesson-tags">
-                    {#each activity.phonemes as phoneme}<span>{phoneme}</span>{/each}
-                    <em>{activity.duration} 分钟</em>
-                  </div>
-                  {#if activity.dependencies.length}<small>前置：{activity.dependencies.map((id) => course.activities.find((item) => item.id === id)?.title).filter(Boolean).join('、')}</small>{/if}
+            <header><span>TODAY · {WIDTH_LABEL[previewWidth].toUpperCase()}</span><h3>{course.title}</h3><p>{course.objective}</p></header>
+            {#each pathLessons as lesson (lesson.index)}
+              <section class="lesson-group">
+                <div class="lesson-heading">
+                  <b>{lesson.title}</b>
+                  <span>{lesson.phonemes.length ? lesson.phonemes.join(' · ') : '无新音素'} · {lesson.minutes} 分钟</span>
                 </div>
-              </article>
+                {#each lesson.activityIds as id (id)}
+                  {@const activity = course.activities.find((item) => item.id === id)}
+                  {#if activity}
+                    <article>
+                      <div class="lesson-number">{course.activities.indexOf(activity) + 1}</div>
+                      <div class="lesson-type {activity.type}">{activity.type}</div>
+                      <div class="lesson-content">
+                        <h4>{activity.title}{#if activity.mergeTag}<em class="merge-flag">{activity.mergeTag}</em>{/if}</h4>
+                        <p>{activity.content}</p>
+                        {#if activity.prompt}<blockquote>{activity.prompt}</blockquote>{/if}
+                        <div class="lesson-tags">
+                          {#each activity.phonemes as phoneme}<span>{phoneme}</span>{/each}
+                          <em>{activity.duration} 分钟</em>
+                        </div>
+                        {#if activity.dependencies.length}<small>前置：{activity.dependencies.map((depId) => course.activities.find((item) => item.id === depId)?.title).filter(Boolean).join('、')}</small>{/if}
+                      </div>
+                    </article>
+                  {/if}
+                {/each}
+              </section>
             {/each}
-            <footer>课程结束 · 预计 {totalMinutes} 分钟</footer>
+            <footer>课程结束 · 共 {pathLessons.length} 课 · 预计 {totalMinutes} 分钟</footer>
           </div>
         </div>
       </div>
@@ -743,11 +857,11 @@
   {#if activeView === 'issues'}
     <main class="issues-view">
       <div class="view-heading">
-        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
+        <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明、依赖完整性与循环依赖。</p></div>
         <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
       </div>
       <div class="issue-board">
-        {#each diagnostics as issue, index}
+        {#each diagnostics as issue, index (issue.id)}
           <article class:critical={issue.level === 'error'} class:caution={issue.level === 'warning'} class:info={issue.level === 'info'}>
             <span class="issue-index">{String(index + 1).padStart(2, '0')}</span>
             <div><div class="issue-meta"><Tag type={issue.level === 'error' ? 'red' : issue.level === 'warning' ? 'magenta' : 'blue'}>{issue.category}</Tag><small>{issue.level === 'error' ? '必须处理' : issue.level === 'warning' ? '建议调整' : '教学提示'}</small></div><h3>{issue.title}</h3><p>{issue.detail}</p></div>
@@ -771,31 +885,156 @@
   {#if activeView === 'versions'}
     <main class="versions-view">
       <div class="view-heading">
-        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。</p></div>
-        <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
+        <div><span class="kicker">OFFLINE MERGE & HISTORY</span><h2>版本与离线合并</h2><p>导入同事的整包课程时按活动编号逐条合并；选定前当前课程不会被改动。结构 v{COURSE_SCHEMA_VERSION}。</p></div>
+        <div class="version-actions">
+          <Button kind="ghost" on:click={copyCourse}>复制课程</Button>
+          <Button kind="tertiary" on:click={exportPackage}>导出离线包</Button>
+          <Button kind="primary" on:click={saveVersion}>保存新版本</Button>
+        </div>
       </div>
+
+      <Tile class="import-card">
+        <div class="section-title">
+          <div><span class="kicker">IMPORT PACKAGE</span><h3>导入离线课程包</h3><p>选择其他老师导出的 JSON 文件，或直接粘贴课程包内容。旧数据会先按新结构升级补齐再合并。</p></div>
+          <label class="file-button"><input type="file" accept="application/json,.json" on:change={handleImportFile} /><span>选择文件</span></label>
+        </div>
+        <TextArea rows={4} placeholder={importPlaceholder} value={importText} on:input={(event) => (importText = readText(event))} />
+        <div class="import-actions">
+          <Button kind="primary" disabled={!importText.trim()} on:click={parseImport}>生成合并方案</Button>
+          {#if mergePlan}<Button kind="ghost" on:click={dismissMerge}>放弃方案</Button>{/if}
+          {#if importError}<Tag type="red">{importError}</Tag>{/if}
+        </div>
+
+        {#if mergePlan}
+          <div class="merge-stage">
+            <div class="merge-summary">
+              <Tag type="cyan">来自：{mergePlan.incomingTitle}</Tag>
+              <Tag type="gray">{mergePlan.baseVersionLabel ? `共同版本：${mergePlan.baseVersionLabel}` : '无共同版本，按两边都改保守处理'}</Tag>
+              <Tag type="green">直接补入 {mergePlan.counts['added-incoming']}</Tag>
+              <Tag type="purple">并列两版 {mergePlan.counts.divergent}</Tag>
+              <Tag type="teal">一边修改 {mergePlan.counts['one-sided']}</Tag>
+              <Tag type="gray">一致 {mergePlan.counts.unchanged}</Tag>
+            </div>
+            {#if mergePlan.incomingUpgradeNotes.length}
+              <InlineNotification class="merge-note" lowContrast kind="info" title="导入包已按新结构升级" subtitle={mergePlan.incomingUpgradeNotes.join('；')} hideCloseButton />
+            {/if}
+
+            {#each entryGroups as group}
+              {@const rows = mergePlan.entries.filter((entry) => entry.status === group.key)}
+              {#if rows.length}
+                <h4 class="merge-group-heading">{group.heading}（{rows.length}）</h4>
+                <div class="merge-entries">
+                  {#each rows as entry (entry.id)}
+                    <article class="merge-entry {entry.status}">
+                      <header>
+                        <span class="entry-id">{entry.id}</span>
+                        <Tag type={entry.status === 'divergent' ? 'purple' : entry.status === 'added-incoming' ? 'green' : 'cool-gray'}>{statusLabel(entry.status)}</Tag>
+                        {#if entry.changedFields.length}<small>差异：{describeChangedFields(entry.changedFields)}</small>{/if}
+                      </header>
+                      <div class="entry-sides">
+                        <div class:missing={!entry.local}>
+                          <b>本地版</b>
+                          {#if entry.local}
+                            <p>{entry.local.title}</p>
+                            <small>{entry.local.type} · {entry.local.duration} 分钟 · 音素 {entry.local.phonemes.join(' ') || '—'} · 依赖 {entry.local.dependencies.length}</small>
+                            <small class="entry-feedback">反馈：{entry.local.feedback || '（空）'}</small>
+                          {:else}<small class="entry-missing">本地没有这条活动</small>{/if}
+                        </div>
+                        <div class:missing={!entry.incoming}>
+                          <b>导入版</b>
+                          {#if entry.incoming}
+                            <p>{entry.incoming.title}</p>
+                            <small>{entry.incoming.type} · {entry.incoming.duration} 分钟 · 音素 {entry.incoming.phonemes.join(' ') || '—'} · 依赖 {entry.incoming.dependencies.length}</small>
+                            <small class="entry-feedback">反馈：{entry.incoming.feedback || '（空）'}</small>
+                          {:else}<small class="entry-missing">导入包没有这条活动</small>{/if}
+                        </div>
+                      </div>
+                      {#if entry.status === 'divergent' || entry.status === 'one-sided'}
+                        <div class="resolution-row" role="radiogroup" aria-label="合并处理方式">
+                          {#if entry.status === 'divergent'}
+                            <label><input type="radio" name={`resolution-${entry.id}`} checked={entry.resolution === 'keep-both'} on:change={() => setResolution(entry, 'keep-both')} />并列留两版（导入版编号 {entry.incomingCloneId}）</label>
+                          {/if}
+                          <label><input type="radio" name={`resolution-${entry.id}`} checked={entry.resolution === 'use-local'} on:change={() => setResolution(entry, 'use-local')} />只用本地版</label>
+                          <label><input type="radio" name={`resolution-${entry.id}`} checked={entry.resolution === 'use-incoming'} on:change={() => setResolution(entry, 'use-incoming')} />只用导入版</label>
+                        </div>
+                      {/if}
+                    </article>
+                  {/each}
+                </div>
+              {/if}
+            {/each}
+
+            {#if capacity}
+              <div class="capacity-bar" class:short={!capacity.fits}>
+                <div>
+                  <span class="kicker">LOCAL CAPACITY</span>
+                  <b>{capacity.fits ? '容量足够，可以安全合并' : '本地容量不足，合并将被拒绝'}</b>
+                  <p>
+                    当前课程 {formatKb(capacity.currentBytes)} → 合并后 {formatKb(capacity.mergedBytes)}，
+                    写入峰值需 {formatKb(capacity.requiredBytes)}，试写探测可用 {formatKb(capacity.availableBytes)}。
+                    {#if !capacity.fits}缺口约 {formatKb(Math.max(0, capacity.requiredBytes - capacity.availableBytes))}。{/if}
+                  </p>
+                </div>
+                <Tag type={capacity.fits ? 'green' : 'red'}>{capacity.fits ? '通过' : '拒绝写入'}</Tag>
+              </div>
+
+              {#if !capacity.fits && capacity.reclaimable.length}
+                <div class="reclaim-panel">
+                  <h4>可回收的旧版本快照（在用的活动课程不会被动）</h4>
+                  <p class="empty-state">勾选要回收的快照，可在应用前先清理（预计腾出 {formatKb(capacity.reclaimableBytes)}，当前已选 {formatKb(selectedReclaimBytes(capacity))}）：</p>
+                  {#each capacity.reclaimable as item (item.versionId)}
+                    <div class="reclaim-row">
+                      <Checkbox checked={selectedReclaimIds.has(item.versionId)} on:change={(event) => toggleReclaim(item.versionId, readChecked(event))} labelText={`${item.label} · ${formatTime(item.savedAt)} · ${item.activityCount} 个活动 · ${formatKb(item.bytes)}`} />
+                    </div>
+                  {/each}
+                </div>
+              {:else if !capacity.fits}
+                <InlineNotification lowContrast kind="error" title="没有可回收的旧版本快照" subtitle="请先在本机其他存储中腾出空间，再重试合并。" hideCloseButton />
+              {/if}
+
+              {#if mergePlan.versionsToBring.length}
+                <div class="exclude-versions">
+                  <Checkbox checked={excludeIncomingVersions} on:change={toggleExcludeIncomingVersions} labelText={`不导入随包附带的 ${mergePlan.versionsToBring.length} 个历史快照（只合并当前活动，可省空间）`} />
+                </div>
+              {/if}
+            {/if}
+
+            <div class="merge-actions">
+              <Button kind="danger" disabled={capacity ? !capacity.fits : false} on:click={executeMerge}>{capacity?.fits === false ? '容量不足，拒绝合并' : '应用合并到当前课程'}</Button>
+              <Button kind="ghost" on:click={reclaimSelectedVersions} disabled={!selectedReclaimIds.size}>先回收选中的 {selectedReclaimIds.size} 个旧版本</Button>
+            </div>
+            <p class="merge-disclaimer">在点击“应用合并”前，当前课程保持原样；应用时采用临时键试写，任一环节失败都会保留在用课程。</p>
+          </div>
+        {/if}
+      </Tile>
+
       <div class="version-layout-svelte">
         <Tile class="version-timeline">
-          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{course.versions.length} 个快照</Tag></div>
+          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{course.versions.length} 个快照 · {formatKb(listReclaimableVersions(course).reduce((sum, item) => sum + item.bytes, 0))}</Tag></div>
           {#each course.versions as version, index (version.id)}
             <article class:latest={index === course.versions.length - 1}>
               <span class="timeline-dot"></span>
-              <div><b>{version.label}</b><h4>{version.note}</h4><p>{formatTime(version.savedAt)} · {version.activities.length} 个活动</p></div>
+              <div class="version-row">
+                <div><b>{version.label}</b><h4>{version.note}</h4><p>{formatTime(version.savedAt)} · {version.activities.length} 个活动 · {formatKb(JSON.stringify(version).length)}</p></div>
+                <Button size="small" kind="danger-ghost" on:click={() => deleteVersion(version.id)}>回收</Button>
+              </div>
             </article>
+          {:else}
+            <p class="empty-state">还没有版本快照。“保存新版本”会冻结一份活动、依赖与反馈快照。</p>
           {/each}
         </Tile>
         <Tile class="diff-card">
           <div class="section-title"><div><span class="kicker">COMPARE</span><h3>比较两个版本</h3></div></div>
           <div class="compare-pickers">
-            <Select labelText="基准版本" selected={compareBaseId} on:change={(event) => compareBaseId = readText(event)}>
+            <Select labelText="基准版本" selected={compareBaseId} on:change={(event) => (compareBaseId = readText(event))}>
               {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
             </Select>
-            <Select labelText="目标版本" selected={compareTargetId} on:change={(event) => compareTargetId = readText(event)}>
+            <Select labelText="目标版本" selected={compareTargetId} on:change={(event) => (compareTargetId = readText(event))}>
               {#each course.versions as version}<SelectItem value={version.id} text={`${version.label} · ${formatTime(version.savedAt)}`} />{/each}
             </Select>
           </div>
           <div class="diff-list">
-            {#each versionDiff as diff}
+            {#each versionDiff as diff (diff.id + diff.kind)}
               <article class={diff.kind}><span>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</span><div><b>{diff.title}</b><p>{diff.detail}</p></div></article>
             {:else}
               <p class="empty-state">两个版本之间没有活动差异，或尚未选择版本。</p>
@@ -807,7 +1046,7 @@
   {/if}
 
   <footer class="app-footer">
-    <span>所有数据保存在当前浏览器 localStorage</span>
+    <span>所有数据保存在当前浏览器 localStorage · 结构 v{COURSE_SCHEMA_VERSION}</span>
     <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Alt + N 新建活动 · Ctrl/Cmd + S 保存</span>
   </footer>
 </div>
