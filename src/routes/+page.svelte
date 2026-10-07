@@ -13,7 +13,7 @@
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
-  type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
+  type ViewMode = 'compose' | 'path' | 'issues' | 'versions' | 'merge';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
 
@@ -66,7 +66,65 @@
     detail: string;
   }
 
+  interface PathStage {
+    items: Activity[];
+    startIndex: number;
+    minutes: number;
+  }
+
+  interface LearningPath {
+    width: PreviewWidth;
+    stages: PathStage[];
+    blocked: Activity[];
+    totalMinutes: number;
+  }
+
+  interface DerivedSnapshot {
+    fingerprint: string;
+    computedAt: string;
+    diagnostics: Diagnostic[];
+    cycle: string[] | null;
+    paths: Record<PreviewWidth, LearningPath>;
+  }
+
+  type MergeResolution = 'local' | 'incoming' | 'both';
+
+  interface MergeConflict {
+    id: string;
+    local: Activity;
+    incoming: Activity;
+    changedFields: string[];
+    resolution: MergeResolution | null;
+  }
+
+  interface MergePlan {
+    sourceTitle: string;
+    sourceUpdatedAt: string;
+    added: Activity[];
+    identical: number;
+    localOnly: number;
+    conflicts: MergeConflict[];
+    upgradedFields: number;
+  }
+
+  interface RecyclableVersion {
+    id: string;
+    label: string;
+    savedAt: string;
+    bytes: number;
+  }
+
+  interface MergeRejection {
+    neededBytes: number;
+    usageBytes: number | null;
+    quotaBytes: number | null;
+    recyclable: RecyclableVersion[];
+  }
+
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const EXPORT_SCHEMA = 'sologsb-1026-course-package@1';
+  const ACTIVITY_TYPES: ActivityType[] = ['音素', '单词', '句子', '练习'];
+  const WIDTH_STAGE_SIZE: Record<PreviewWidth, number> = { phone: 2, tablet: 3, desktop: 4 };
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
@@ -172,10 +230,24 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let derivedCache: DerivedSnapshot | null = null;
+  let derived: DerivedSnapshot = getDerived(course);
+  let learningPath: LearningPath = derived.paths[previewWidth];
+  let importText = '';
+  let importError = '';
+  let mergePlan: MergePlan | null = null;
+  let mergeRejection: MergeRejection | null = null;
+  let mergeMessage = '';
+  let mergeReady = false;
+  let capacityLabel = '正在估算本地容量…';
+  let storageWarning = '';
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
-  $: diagnostics = analyzeCourse(course);
+  $: derived = getDerived(course);
+  $: diagnostics = derived.diagnostics;
+  $: learningPath = derived.paths[previewWidth];
   $: versionDiff = compareCourseVersions(course, compareBaseId, compareTargetId);
+  $: mergeReady = mergePlan !== null && mergePlan.conflicts.every((conflict) => conflict.resolution !== null);
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
@@ -184,7 +256,7 @@
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       try {
-        course = migrateCourse(JSON.parse(stored) as Course);
+        course = migrateCourse(JSON.parse(stored));
         selectedActivityId = course.activities[0]?.id ?? '';
         compareBaseId = course.versions[0]?.id ?? '';
         compareTargetId = course.versions.at(-1)?.id ?? '';
@@ -194,6 +266,7 @@
       }
     }
     hydrated = true;
+    void refreshCapacity();
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -207,10 +280,103 @@
     };
   });
 
-  function migrateCourse(value: Course): Course {
-    if (!value.id || !Array.isArray(value.activities)) return initialCourse();
-    value.versions ??= [];
-    return value;
+  function upgradedText(record: Record<string, unknown>, key: string, fallback: string, onUpgrade: () => void): string {
+    const value = record[key];
+    if (typeof value === 'string') return value;
+    onUpgrade();
+    return fallback;
+  }
+
+  function normalizeActivity(raw: unknown, index: number, onUpgrade: () => void): Activity {
+    const isRecord = Boolean(raw) && typeof raw === 'object' && !Array.isArray(raw);
+    if (!isRecord) onUpgrade();
+    const record = (isRecord ? raw : {}) as Record<string, unknown>;
+
+    const numberField = (key: string, fallback: number, min: number, max: number): number => {
+      const value = record[key];
+      if (value === undefined || value === null) {
+        onUpgrade();
+        return fallback;
+      }
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return Math.min(max, Math.max(min, Math.round(parsed)));
+      onUpgrade();
+      return fallback;
+    };
+    const listField = (key: string): string[] => {
+      const value = record[key];
+      if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+      if (typeof value === 'string') {
+        onUpgrade();
+        return value.split(/[\s,，、]+/).map((item) => item.trim()).filter(Boolean);
+      }
+      onUpgrade();
+      return [];
+    };
+
+    let type: ActivityType = '练习';
+    if (ACTIVITY_TYPES.includes(record.type as ActivityType)) type = record.type as ActivityType;
+    else onUpgrade();
+
+    return {
+      id: upgradedText(record, 'id', `a-legacy-${index + 1}`, onUpgrade),
+      type,
+      title: upgradedText(record, 'title', `未命名活动 ${index + 1}`, onUpgrade),
+      content: upgradedText(record, 'content', '', onUpgrade),
+      phonemes: listField('phonemes'),
+      dependencies: listField('dependencies'),
+      difficulty: numberField('difficulty', 1, 1, 5),
+      prompt: upgradedText(record, 'prompt', '', onUpgrade),
+      accessibility: upgradedText(record, 'accessibility', '', onUpgrade),
+      duration: numberField('duration', 8, 1, 600),
+      feedback: upgradedText(record, 'feedback', '', onUpgrade)
+    };
+  }
+
+  function normalizeCourse(raw: unknown): { course: Course; upgraded: number } | null {
+    let source: unknown = raw;
+    if (source && typeof source === 'object' && !Array.isArray(source)) {
+      const wrapped = (source as Record<string, unknown>).course;
+      if (wrapped && typeof wrapped === 'object') source = wrapped;
+    }
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+    const record = source as Record<string, unknown>;
+    if (!Array.isArray(record.activities)) return null;
+
+    let upgraded = 0;
+    const onUpgrade = () => { upgraded += 1; };
+    const activities = record.activities.map((item, index) => normalizeActivity(item, index, onUpgrade));
+    const versions: CourseVersion[] = Array.isArray(record.versions)
+      ? record.versions
+          .filter((version): version is Record<string, unknown> => Boolean(version) && typeof version === 'object' && !Array.isArray(version))
+          .map((version, index) => ({
+            id: upgradedText(version, 'id', `v-legacy-${index + 1}`, onUpgrade),
+            label: upgradedText(version, 'label', `旧版本 ${index + 1}`, onUpgrade),
+            savedAt: upgradedText(version, 'savedAt', new Date().toISOString(), onUpgrade),
+            note: upgradedText(version, 'note', '', onUpgrade),
+            activities: Array.isArray(version.activities)
+              ? version.activities.map((item, itemIndex) => normalizeActivity(item, itemIndex, onUpgrade))
+              : []
+          }))
+      : [];
+
+    return {
+      course: {
+        id: upgradedText(record, 'id', `course-${Date.now()}`, onUpgrade),
+        title: upgradedText(record, 'title', '未命名课程', onUpgrade),
+        level: upgradedText(record, 'level', '未设置等级', onUpgrade),
+        ageRange: upgradedText(record, 'ageRange', '', onUpgrade),
+        objective: upgradedText(record, 'objective', '', onUpgrade),
+        activities,
+        versions,
+        updatedAt: upgradedText(record, 'updatedAt', new Date().toISOString(), onUpgrade)
+      },
+      upgraded
+    };
+  }
+
+  function migrateCourse(value: unknown): Course {
+    return normalizeCourse(value)?.course ?? initialCourse();
   }
 
   function commit(recipe: (draft: Course) => void): void {
@@ -225,8 +391,14 @@
 
   function persist(): void {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
-    savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
+      storageWarning = '';
+      savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
+    } catch {
+      storageWarning = '本地容量不足，本次修改未能写入。当前课程内容未受影响，可在“合并导入”页删除可回收的旧版本后重试。';
+      savedLabel = '写入失败 · 本地容量不足';
+    }
   }
 
   function undo(): void {
@@ -507,6 +679,275 @@
     return rows;
   }
 
+  function fingerprintActivities(activities: Activity[]): string {
+    return JSON.stringify(activities.map((activity) => [
+      activity.id, activity.type, activity.title, activity.content, activity.phonemes,
+      activity.dependencies, activity.difficulty, activity.prompt, activity.accessibility,
+      activity.duration, activity.feedback
+    ]));
+  }
+
+  function getDerived(current: Course): DerivedSnapshot {
+    const fingerprint = fingerprintActivities(current.activities);
+    if (derivedCache && derivedCache.fingerprint === fingerprint) return derivedCache;
+    const activities = current.activities;
+    derivedCache = {
+      fingerprint,
+      computedAt: new Date().toISOString(),
+      diagnostics: analyzeCourse(current),
+      cycle: findDependencyCycle(activities),
+      paths: {
+        phone: computeLearningPath(activities, 'phone'),
+        tablet: computeLearningPath(activities, 'tablet'),
+        desktop: computeLearningPath(activities, 'desktop')
+      }
+    };
+    return derivedCache;
+  }
+
+  function computeLearningPath(activities: Activity[], width: PreviewWidth): LearningPath {
+    const byId = new Map(activities.map((activity) => [activity.id, activity]));
+    const placed = new Set<string>();
+    const ordered: Activity[] = [];
+    let remaining = [...activities];
+    let progressed = true;
+    while (remaining.length > 0 && progressed) {
+      progressed = false;
+      const stuck: Activity[] = [];
+      for (const activity of remaining) {
+        const knownDependencies = activity.dependencies.filter((dependency) => byId.has(dependency));
+        if (knownDependencies.every((dependency) => placed.has(dependency))) {
+          placed.add(activity.id);
+          ordered.push(activity);
+          progressed = true;
+        } else {
+          stuck.push(activity);
+        }
+      }
+      remaining = stuck;
+    }
+    const stageSize = WIDTH_STAGE_SIZE[width];
+    const stages: PathStage[] = [];
+    for (let start = 0; start < ordered.length; start += stageSize) {
+      const items = ordered.slice(start, start + stageSize);
+      stages.push({ items, startIndex: start, minutes: items.reduce((sum, activity) => sum + activity.duration, 0) });
+    }
+    return {
+      width,
+      stages,
+      blocked: remaining,
+      totalMinutes: ordered.reduce((sum, activity) => sum + activity.duration, 0)
+    };
+  }
+
+  function activitySignature(activity: Activity): string {
+    return JSON.stringify([
+      activity.type, activity.title, activity.content, activity.phonemes, activity.dependencies,
+      activity.difficulty, activity.prompt, activity.accessibility, activity.duration, activity.feedback
+    ]);
+  }
+
+  function diffActivityFields(local: Activity, incoming: Activity): string[] {
+    const fields: string[] = [];
+    if (local.type !== incoming.type) fields.push('类型');
+    if (local.title !== incoming.title) fields.push('标题');
+    if (local.content !== incoming.content) fields.push('内容');
+    if (JSON.stringify(local.phonemes) !== JSON.stringify(incoming.phonemes)) fields.push('音素');
+    if (JSON.stringify(local.dependencies) !== JSON.stringify(incoming.dependencies)) fields.push('依赖');
+    if (local.difficulty !== incoming.difficulty) fields.push('难度');
+    if (local.duration !== incoming.duration) fields.push('时长');
+    if (local.prompt !== incoming.prompt) fields.push('提示语');
+    if (local.accessibility !== incoming.accessibility) fields.push('无障碍说明');
+    if (local.feedback !== incoming.feedback) fields.push('练习反馈');
+    return fields;
+  }
+
+  function buildMergePlan(raw: unknown): MergePlan | null {
+    const normalized = normalizeCourse(raw);
+    if (!normalized) return null;
+    const incoming = normalized.course;
+    const localById = new Map(course.activities.map((activity) => [activity.id, activity]));
+    const incomingIds = new Set<string>();
+    const added: Activity[] = [];
+    const conflicts: MergeConflict[] = [];
+    let identical = 0;
+    for (const activity of incoming.activities) {
+      if (incomingIds.has(activity.id)) continue;
+      incomingIds.add(activity.id);
+      const local = localById.get(activity.id);
+      if (!local) {
+        added.push(activity);
+        continue;
+      }
+      if (activitySignature(local) === activitySignature(activity)) {
+        identical += 1;
+        continue;
+      }
+      conflicts.push({ id: activity.id, local, incoming: activity, changedFields: diffActivityFields(local, activity), resolution: null });
+    }
+    return {
+      sourceTitle: incoming.title,
+      sourceUpdatedAt: incoming.updatedAt,
+      added,
+      identical,
+      localOnly: course.activities.filter((activity) => !incomingIds.has(activity.id)).length,
+      conflicts,
+      upgradedFields: normalized.upgraded
+    };
+  }
+
+  async function storageEstimate(): Promise<{ usage: number | null; quota: number | null }> {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) {
+        const { usage, quota } = await navigator.storage.estimate();
+        return { usage: usage ?? null, quota: quota ?? null };
+      }
+    } catch { /* 估算不可用时改用试写校验 */ }
+    return { usage: null, quota: null };
+  }
+
+  function probePersist(payload: string): boolean {
+    const probeKey = `${STORAGE_KEY}:probe`;
+    try {
+      localStorage.setItem(probeKey, payload);
+      localStorage.removeItem(probeKey);
+      return true;
+    } catch {
+      try { localStorage.removeItem(probeKey); } catch { /* 忽略清理失败 */ }
+      return false;
+    }
+  }
+
+  function recyclableVersions(): RecyclableVersion[] {
+    return course.versions
+      .map((version) => ({ id: version.id, label: version.label, savedAt: version.savedAt, bytes: new Blob([JSON.stringify(version)]).size }))
+      .sort((left, right) => left.savedAt.localeCompare(right.savedAt));
+  }
+
+  async function refreshCapacity(): Promise<void> {
+    const { usage, quota } = await storageEstimate();
+    capacityLabel = quota !== null
+      ? `本地存储已用 ${formatBytes(usage ?? 0)} · 配额约 ${formatBytes(quota)}`
+      : '浏览器未提供容量估算，合并前会自动试写校验，不会写坏当前课程';
+  }
+
+  function exportCourse(): void {
+    const payload = JSON.stringify({ schema: EXPORT_SCHEMA, exportedAt: new Date().toISOString(), course }, null, 2);
+    const url = URL.createObjectURL(new Blob([payload], { type: 'application/json' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${course.title.replace(/\s+/g, '-')}.course.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    savedLabel = '课程包已导出';
+  }
+
+  function handleImportFile(event: Event): void {
+    const file = (event.currentTarget as HTMLInputElement).files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      importText = String(reader.result ?? '');
+      parseImport();
+    };
+    reader.readAsText(file);
+  }
+
+  function parseImport(): void {
+    importError = '';
+    mergeMessage = '';
+    mergeRejection = null;
+    mergePlan = null;
+    if (!importText.trim()) return;
+    try {
+      const plan = buildMergePlan(JSON.parse(importText));
+      if (!plan) {
+        importError = '无法识别的课程包：缺少活动列表。';
+        return;
+      }
+      mergePlan = plan;
+      void refreshCapacity();
+    } catch {
+      importError = 'JSON 解析失败，请检查课程包内容是否完整。';
+    }
+  }
+
+  function setResolution(conflict: MergeConflict, resolution: MergeResolution): void {
+    conflict.resolution = resolution;
+    mergePlan = mergePlan;
+  }
+
+  function discardMerge(): void {
+    mergePlan = null;
+    mergeRejection = null;
+    mergeMessage = '';
+    importError = '';
+  }
+
+  function nextMergeId(merged: Course, base: string): string {
+    let suffix = 1;
+    let candidate = `${base}-imp-${suffix}`;
+    while (merged.activities.some((activity) => activity.id === candidate)) {
+      suffix += 1;
+      candidate = `${base}-imp-${suffix}`;
+    }
+    return candidate;
+  }
+
+  async function applyMerge(): Promise<void> {
+    if (!mergePlan || !mergeReady) return;
+    const plan = mergePlan;
+    const merged = structuredClone(course);
+    for (const conflict of plan.conflicts) {
+      const index = merged.activities.findIndex((activity) => activity.id === conflict.id);
+      if (index < 0) continue;
+      if (conflict.resolution === 'incoming') {
+        merged.activities[index] = structuredClone(conflict.incoming);
+      } else if (conflict.resolution === 'both') {
+        const copy = structuredClone(conflict.incoming);
+        copy.id = nextMergeId(merged, conflict.id);
+        copy.title = `${copy.title}（导入版）`;
+        merged.activities.splice(index + 1, 0, copy);
+      }
+    }
+    merged.activities.push(...plan.added.map((activity) => structuredClone(activity)));
+
+    const payload = JSON.stringify(merged);
+    const neededBytes = new Blob([payload]).size;
+    const estimate = await storageEstimate();
+    const estimateFails = estimate.quota !== null && estimate.usage !== null && estimate.usage + neededBytes > estimate.quota;
+    if (estimateFails || !probePersist(payload)) {
+      mergeRejection = {
+        neededBytes,
+        usageBytes: estimate.usage,
+        quotaBytes: estimate.quota,
+        recyclable: recyclableVersions()
+      };
+      mergeMessage = '';
+      return;
+    }
+
+    commit((draft) => { draft.activities = merged.activities; });
+    mergePlan = null;
+    mergeRejection = null;
+    importText = '';
+    mergeMessage = `已并入 ${plan.added.length} 个新活动，处理 ${plan.conflicts.length} 个冲突；前置音素、循环依赖与三种宽度的学习路径已失效重算。`;
+    savedLabel = '合并完成 · 学习路径已重算';
+    void refreshCapacity();
+  }
+
+  function recycleVersion(id: string): void {
+    commit((draft) => { draft.versions = draft.versions.filter((version) => version.id !== id); });
+    if (mergeRejection) mergeRejection = { ...mergeRejection, recyclable: recyclableVersions() };
+    void refreshCapacity();
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
   function formatTime(value: string): string {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
@@ -578,6 +1019,12 @@
     </div>
   {/if}
 
+  {#if storageWarning}
+    <div class="offline-notice">
+      <InlineNotification lowContrast kind="error" title="本地写入失败" subtitle={storageWarning} on:close={() => storageWarning = ''} />
+    </div>
+  {/if}
+
   <section class="course-hero">
     <div class="hero-copy">
       <span class="kicker">COURSE BUILDER / {course.level}</span>
@@ -597,6 +1044,7 @@
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'merge'} on:click={() => activeView = 'merge'}><span>05</span><b>合并导入</b><small>离线课程包逐条合并</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -717,23 +1165,32 @@
           <div class="device-bar"><span></span><b>{previewWidth === 'phone' ? '390 px' : previewWidth === 'tablet' ? '768 px' : '1200 px'}</b></div>
           <div class="lesson-preview">
             <header><span>今日学习</span><h3>{course.title}</h3><p>{course.objective}</p></header>
-            {#each course.activities as activity, index (activity.id)}
-              <article>
-                <div class="lesson-number">{index + 1}</div>
-                <div class="lesson-type {activity.type}">{activity.type}</div>
-                <div class="lesson-content">
-                  <h4>{activity.title}</h4>
-                  <p>{activity.content}</p>
-                  {#if activity.prompt}<blockquote>{activity.prompt}</blockquote>{/if}
-                  <div class="lesson-tags">
-                    {#each activity.phonemes as phoneme}<span>{phoneme}</span>{/each}
-                    <em>{activity.duration} 分钟</em>
+            {#each learningPath.stages as stage, stageIndex}
+              <div class="stage-label"><span>第 {stageIndex + 1} 阶段</span><em>{stage.items.length} 个活动 · {stage.minutes} 分钟</em></div>
+              {#each stage.items as activity, itemIndex (activity.id)}
+                <article>
+                  <div class="lesson-number">{stage.startIndex + itemIndex + 1}</div>
+                  <div class="lesson-type {activity.type}">{activity.type}</div>
+                  <div class="lesson-content">
+                    <h4>{activity.title}</h4>
+                    <p>{activity.content}</p>
+                    {#if activity.prompt}<blockquote>{activity.prompt}</blockquote>{/if}
+                    <div class="lesson-tags">
+                      {#each activity.phonemes as phoneme}<span>{phoneme}</span>{/each}
+                      <em>{activity.duration} 分钟</em>
+                    </div>
+                    {#if activity.dependencies.length}<small>前置：{activity.dependencies.map((id) => course.activities.find((item) => item.id === id)?.title).filter(Boolean).join('、')}</small>{/if}
                   </div>
-                  {#if activity.dependencies.length}<small>前置：{activity.dependencies.map((id) => course.activities.find((item) => item.id === id)?.title).filter(Boolean).join('、')}</small>{/if}
-                </div>
-              </article>
+                </article>
+              {/each}
             {/each}
-            <footer>课程结束 · 预计 {totalMinutes} 分钟</footer>
+            {#if learningPath.blocked.length}
+              <div class="blocked-note">
+                <b>暂无法排入学习路径</b>
+                <p>{learningPath.blocked.map((activity) => activity.title).join('、')} 存在循环依赖或失效依赖，修复后会自动失效重算。</p>
+              </div>
+            {/if}
+            <footer>课程结束 · 预计 {learningPath.totalMinutes} 分钟 · 已按最新依赖与音素重算 · {formatTime(derived.computedAt)}</footer>
           </div>
         </div>
       </div>
@@ -744,7 +1201,7 @@
     <main class="issues-view">
       <div class="view-heading">
         <div><span class="kicker">CURRICULUM QA</span><h2>课程质量检查</h2><p>检查前置知识、相似音、例句长度、练习反馈、无障碍说明和依赖完整性。</p></div>
-        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span></div>
+        <div class="issue-summary"><span><b>{errorCount}</b> 必须处理</span><span><b>{warningCount}</b> 建议调整</span><span><b>{diagnostics.length}</b> 全部提示</span><span><b>{formatTime(derived.computedAt)}</b> 最近重算</span></div>
       </div>
       <div class="issue-board">
         {#each diagnostics as issue, index}
@@ -802,6 +1259,118 @@
             {/each}
           </div>
         </Tile>
+      </div>
+    </main>
+  {/if}
+
+  {#if activeView === 'merge'}
+    <main class="merge-view">
+      <div class="view-heading">
+        <div><span class="kicker">OFFLINE MERGE</span><h2>课程包合并导入</h2><p>按活动编号逐条合并：只有一边有的直接补上，两边都改过的活动并列两版，选定前不改动当前课程。</p></div>
+        <div class="version-actions"><Button kind="tertiary" on:click={exportCourse}>导出当前课程包</Button></div>
+      </div>
+
+      {#if mergeMessage}
+        <div class="merge-notice"><InlineNotification lowContrast kind="success" title="合并完成" subtitle={mergeMessage} on:close={() => mergeMessage = ''} /></div>
+      {/if}
+
+      <div class="merge-layout">
+        <Tile class="merge-card">
+          <div class="section-title">
+            <div><span class="kicker">PACKAGE</span><h3>导入课程包</h3><p>粘贴同事导出的 JSON 或选择文件；旧版结构会先按新结构补齐字段，再参与合并。</p></div>
+          </div>
+          <TextArea rows={8} labelText="课程包 JSON" placeholder={'{"schema":"sologsb-1026-course-package@1", …}'} value={importText} on:input={(event) => importText = readText(event)} />
+          <div class="merge-actions">
+            <input type="file" accept="application/json,.json" on:change={handleImportFile} aria-label="选择课程包文件" />
+            <Button size="small" kind="primary" disabled={!importText.trim()} on:click={parseImport}>解析并生成合并方案</Button>
+            {#if mergePlan}<Button size="small" kind="ghost" on:click={discardMerge}>放弃合并</Button>{/if}
+          </div>
+          {#if importError}
+            <InlineNotification lowContrast kind="error" title="无法导入" subtitle={importError} on:close={() => importError = ''} />
+          {/if}
+          <p class="capacity-line">{capacityLabel}</p>
+        </Tile>
+
+        {#if mergeRejection}
+          <Tile class="merge-card rejection">
+            <InlineNotification lowContrast kind="error" title="本地容量不足，已拒绝本次合并" subtitle="当前课程未被修改。删除可回收的旧版本后可重试合并。" />
+            <div class="rejection-facts">
+              <span>合并后需要 <b>{formatBytes(mergeRejection.neededBytes)}</b></span>
+              {#if mergeRejection.quotaBytes !== null}
+                <span>已用 <b>{formatBytes(mergeRejection.usageBytes ?? 0)}</b> / 配额约 <b>{formatBytes(mergeRejection.quotaBytes)}</b></span>
+              {/if}
+            </div>
+            <h4>可回收的旧版本</h4>
+            <ul class="recycle-list">
+              {#each mergeRejection.recyclable as item (item.id)}
+                <li>
+                  <span>{item.label} · {formatTime(item.savedAt)}</span>
+                  <em>{formatBytes(item.bytes)}</em>
+                  <Button size="small" kind="danger-ghost" on:click={() => recycleVersion(item.id)}>删除</Button>
+                </li>
+              {:else}
+                <li><span>没有可回收的旧版本，请清理浏览器存储后重试。</span></li>
+              {/each}
+            </ul>
+            <div class="merge-actions">
+              <Button size="small" kind="primary" on:click={applyMerge}>重试合并</Button>
+              <Button size="small" kind="ghost" on:click={discardMerge}>放弃合并</Button>
+            </div>
+          </Tile>
+        {/if}
+
+        {#if mergePlan}
+          <Tile class="merge-card">
+            <div class="section-title">
+              <div><span class="kicker">PLAN</span><h3>合并方案 · {mergePlan.sourceTitle}</h3><p>方案仅基于副本计算，应用之前当前课程保持不变。</p></div>
+              <Tag type="cool-gray">{formatTime(mergePlan.sourceUpdatedAt)}</Tag>
+            </div>
+            <div class="merge-summary">
+              <div><strong>{mergePlan.added.length}</strong><span>新增直接补上</span></div>
+              <div><strong>{mergePlan.identical}</strong><span>两边一致</span></div>
+              <div><strong>{mergePlan.localOnly}</strong><span>仅本地保留</span></div>
+              <div><strong>{mergePlan.conflicts.length}</strong><span>待选定冲突</span></div>
+              <div><strong>{mergePlan.upgradedFields}</strong><span>旧结构补齐字段</span></div>
+            </div>
+            {#if mergePlan.added.length}
+              <h4 class="merge-subtitle">将补上的新活动</h4>
+              <div class="added-chips">{#each mergePlan.added as activity (activity.id)}<span>{activity.type} · {activity.title}</span>{/each}</div>
+            {/if}
+            {#each mergePlan.conflicts as conflict (conflict.id)}
+              <article class="conflict-card">
+                <header><b>{conflict.id}</b><span>变化字段：{conflict.changedFields.join('、')}</span></header>
+                <div class="conflict-grid">
+                  <div class="conflict-panel">
+                    <h4>本地版本</h4>
+                    <p>{conflict.local.title}</p>
+                    <small>{conflict.local.type} · {conflict.local.duration} 分钟 · 难度 {conflict.local.difficulty}/5</small>
+                    <small>音素：{conflict.local.phonemes.join('、') || '—'}</small>
+                    <small>依赖：{conflict.local.dependencies.join('、') || '—'}</small>
+                    <small>反馈：{conflict.local.feedback || '—'}</small>
+                  </div>
+                  <div class="conflict-panel incoming">
+                    <h4>导入版本</h4>
+                    <p>{conflict.incoming.title}</p>
+                    <small>{conflict.incoming.type} · {conflict.incoming.duration} 分钟 · 难度 {conflict.incoming.difficulty}/5</small>
+                    <small>音素：{conflict.incoming.phonemes.join('、') || '—'}</small>
+                    <small>依赖：{conflict.incoming.dependencies.join('、') || '—'}</small>
+                    <small>反馈：{conflict.incoming.feedback || '—'}</small>
+                  </div>
+                </div>
+                <div class="resolution-row">
+                  <label><input type="radio" name={`resolution-${conflict.id}`} checked={conflict.resolution === 'local'} on:change={() => setResolution(conflict, 'local')} /> 保留本地版</label>
+                  <label><input type="radio" name={`resolution-${conflict.id}`} checked={conflict.resolution === 'incoming'} on:change={() => setResolution(conflict, 'incoming')} /> 采用导入版</label>
+                  <label><input type="radio" name={`resolution-${conflict.id}`} checked={conflict.resolution === 'both'} on:change={() => setResolution(conflict, 'both')} /> 两版并列保留</label>
+                </div>
+              </article>
+            {/each}
+            <div class="merge-actions">
+              <Button kind="primary" disabled={!mergeReady} on:click={applyMerge}>应用合并</Button>
+              <Button kind="ghost" on:click={discardMerge}>放弃合并</Button>
+              {#if !mergeReady}<span class="merge-hint">请先为每个冲突选定保留方式</span>{/if}
+            </div>
+          </Tile>
+        {/if}
       </div>
     </main>
   {/if}
